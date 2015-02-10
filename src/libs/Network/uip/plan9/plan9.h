@@ -23,6 +23,10 @@
 #include <string>
 #include <stdint.h>
 
+extern "C" {
+#include "psock.h"
+}
+
 class Plan9
 {
 public:
@@ -43,19 +47,24 @@ public:
     };
 
     typedef std::map<std::string, EntryData> EntryMap;
-    typedef EntryMap::value_type             Entry;
-    typedef std::map<uint32_t, Entry*>       FidMap;
+    typedef EntryMap::value_type*            Entry;
+    typedef std::map<uint32_t, Entry>        FidMap;
 
 private:
-    void handler();
+    int handler();
+    void message();
 
-    Entry* get_entry(uint8_t, const std::string&);
-    Entry* get_entry(uint32_t) const;
-    void add_fid(uint32_t, Entry*);
+    Entry get_entry(uint8_t, const std::string&);
+    Entry get_entry(uint32_t) const;
+    void add_fid(uint32_t, Entry);
     void remove_fid(uint32_t);
 
+    static const uint32_t INITIAL_MSIZE = 300;
     EntryMap entries;
     FidMap   fids;
+    psock    sock;
+    char     buf[INITIAL_MSIZE];
+    uint32_t msize;
 };
 
 #endif
