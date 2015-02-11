@@ -16,12 +16,12 @@
 //#define DEBUG_PRINTF(...) printf("9p " __VA_ARGS__)
 #define DEBUG_PRINTF(...)
 
-#define FAIL(text) \
+#define ERROR(text) \
     DEBUG_PRINTF("error %s %d\n", text, __LINE__);      \
-    return send_error(text)
+    return error(buf, msize, text);
 
-#define CHECK(cond, text) if (!(cond)) { FAIL(text); }
-#define IOUNIT            (uip_mss() - sizeof (Message::Twrite))
+#define CHECK(cond, text) if (!(cond)) { ERROR(text); }
+#define IOUNIT            (msize - sizeof (Message::Twrite))
 #define PACKEDSTRUCT      struct __attribute__ ((packed))
 
 namespace {
@@ -42,8 +42,7 @@ enum {
     Tversion = 100,
     Tauth    = 102,
     Tattach  = 104,
-    Terror   = 106,
-    Rerror,
+    Rerror   = 107,
     Tflush   = 108,
     Twalk    = 110,
     Topen    = 112,
@@ -96,8 +95,8 @@ PACKEDSTRUCT Qid {
     uint64_t path;
 
     Qid() {}
-    Qid(Plan9::Entry* entry)
-        : type(entry->type), vers(entry->vers), path(uint32_t(entry)) {}
+    Qid(Plan9::Entry entry)
+        : type(entry->second.type), vers(entry->second.vers), path(uint32_t(entry)) {}
 };
 
 PACKEDSTRUCT Stat {
@@ -145,13 +144,7 @@ union __attribute__ ((packed)) Message {
     // size[4] Tremove tag[2] fid[4]
     // size[4] Rremove tag[2]
     // size[4] Tstat tag[2] fid[4]
-
     // size[4] Tattach tag[2] fid[4] afid[4] uname[s] aname[s]
-    PACKEDSTRUCT {
-        Header   _header;
-        uint32_t fid;
-        uint32_t afid;
-    } Tattach;
 
     // size[4] Rattach tag[2] qid[13]
     PACKEDSTRUCT {
@@ -235,8 +228,8 @@ union __attribute__ ((packed)) Message {
         Stat     stat;
     } Rstat;
 
-    // // size[4] Twstat tag[2] fid[4] stat[n]
-    // // size[4] Rwstat tag[2]
+    // size[4] Twstat tag[2] fid[4] stat[n]
+    // size[4] Rwstat tag[2]
     PACKEDSTRUCT {
         Header   _header;
         uint32_t fid;
@@ -267,7 +260,7 @@ inline long flen(const std::string& path)
     return len < 0 ? 0 : len;
 }
 
-size_t putstat(char* buf, char* end, Plan9::Entry* entry)
+size_t putstat(char* buf, char* end, Plan9::Entry entry)
 {
     if (buf + sizeof (Stat) > end)
         return 0;
@@ -277,12 +270,12 @@ size_t putstat(char* buf, char* end, Plan9::Entry* entry)
     stat->type = 0;
     stat->dev = 0;
     stat->qid = entry;
-    stat->mode = entry->type == QTDIR ? (DMDIR | 0755) : 0644;
+    stat->mode = entry->second.type == QTDIR ? (DMDIR | 0755) : 0644;
     stat->atime = stat->mtime = 1423420000;
-    stat->length = (stat->mode & DMDIR) ? 0 : flen(entry->path);
+    stat->length = (stat->mode & DMDIR) ? 0 : flen(entry->first);
     p += sizeof (Stat);
 
-    p = putstr(p, end, entry->path == "/" ? "/" : entry->path.substr(entry->path.rfind('/') + 1).c_str());
+    p = putstr(p, end, entry->first == "/" ? "/" : entry->first.substr(entry->first.rfind('/') + 1).c_str());
     p = putstr(p, end, "smoothie");
     p = putstr(p, end, "smoothie");
     p = putstr(p, end, "smoothie");
@@ -292,19 +285,18 @@ size_t putstat(char* buf, char* end, Plan9::Entry* entry)
     return p - buf;
 }
 
-inline void start_response(Message* msg, uint16_t size)
+inline void response(Message* msg, uint16_t size)
 {
     msg->size = size;
     ++msg->type;
 }
 
-void send_error(const char* text)
+inline void error(char* buf, uint32_t msize, const char* text)
 {
-    char* buf = static_cast<char*>(uip_appdata);
-    Message* msg = static_cast<Message*>(uip_appdata);
+    Message* msg = reinterpret_cast<Message*>(buf);
     msg->type = Rerror;
-    msg->size = putstr(buf + sizeof (Header), buf + uip_mss(), text) - buf;
-    uip_send(msg, msg->size);
+    msg->size = sizeof (Header);
+    msg->size = putstr(buf + sizeof (Header), buf + msize, text) - buf;
 }
 
 // TODO: Move to utils
@@ -323,19 +315,29 @@ std::string join_path(const std::string& a, const std::string& b)
 
 } // anonymous namespace
 
-Plan9::Plan9()  {}
-Plan9::~Plan9() {}
+Plan9::Plan9()
+: msize(INITIAL_MSIZE)
+{
+    PSOCK_INIT(&sock, buf + 4, sizeof(buf) - 4);
+}
 
-Plan9::Entry* Plan9::get_entry(uint8_t type, const std::string& path)
+Plan9::~Plan9()
+{
+    PSOCK_CLOSE(&sock);
+}
+
+Plan9::Entry Plan9::get_entry(uint8_t type, const std::string& path)
 {
     std::string abspath = absolute_path(path);
     auto i = entries.find(abspath);
-    if (i != entries.end())
-        return &(i->second);
-    return &(entries[abspath] = Entry(type, abspath));
+    if (i == entries.end()) {
+        entries[abspath] = EntryData(type);
+        i = entries.find(abspath);
+    }
+    return &(*i);
 }
 
-Plan9::Entry* Plan9::get_entry(uint32_t fid) const
+Plan9::Entry Plan9::get_entry(uint32_t fid) const
 {
     auto i = fids.find(fid);
     if (i == fids.end())
@@ -343,15 +345,15 @@ Plan9::Entry* Plan9::get_entry(uint32_t fid) const
     return i->second;
 }
 
-void Plan9::add_fid(uint32_t fid, Entry* entry)
+void Plan9::add_fid(uint32_t fid, Entry entry)
 {
     fids[fid] = entry;
-    ++entry->refcount;
+    ++entry->second.refcount;
 }
 
 void Plan9::remove_fid(uint32_t fid)
 {
-    --fids[fid]->refcount;
+    --fids[fid]->second.refcount;
     fids.erase(fid);
 }
 
@@ -385,29 +387,47 @@ void Plan9::appcall()
         return;
     }
 
-    if (uip_newdata())
-        instance->handler();
+    instance->handler();
 }
 
-void Plan9::handler()
+int Plan9::handler()
 {
-    Entry* entry;
-    char* buf = static_cast<char*>(uip_appdata);
-    char* end = buf + uip_datalen();
+    Message *msg = reinterpret_cast<Message*>(buf);
 
-    Message* msg = reinterpret_cast<Message*>(buf);
-    CHECK(buf + 2 <= end, EBADMSG_TEXT);
-    CHECK(buf + msg->size <= end, EBADMSG_TEXT);
+    PSOCK_BEGIN(&sock);
 
-    DEBUG_PRINTF("datalen=%d\n", uip_datalen());
+    for (;;) {
+        PSOCK_READBUF_LEN(&sock, 4);
+        memcpy(buf, buf + 4, 4);
+
+        DEBUG_PRINTF("recv size=%lu\n", msg->size);
+        if (msg->size > msize) {
+            DEBUG_PRINTF("Bad message received %lu\n", msg->size);
+            PSOCK_CLOSE_EXIT(&sock);
+        } else {
+            PSOCK_READBUF_LEN(&sock, msg->size - 4);
+            DEBUG_PRINTF("recv size=%lu type=%u tag=%d\n", msg->size, msg->type, msg->tag);
+        }
+
+        message();
+        PSOCK_SEND(&sock, buf, msg->size);
+        DEBUG_PRINTF("send size=%lu type=%u tag=%d\n", msg->size, msg->type, msg->tag);
+    }
+
+    PSOCK_END(&sock);
+}
+
+void Plan9::message()
+{
+    Entry entry;
+    Message *msg = reinterpret_cast<Message*>(buf);
 
     switch (msg->type) {
     case Tversion:
         DEBUG_PRINTF("Tversion\n");
-        start_response(msg, sizeof (msg->Rversion));
-        if (uip_mss() < msg->Rversion.msize)
-            msg->Rversion.msize = uip_mss();
-        msg->size = putstr(buf + msg->size, buf + uip_mss(), "9P2000") - buf;
+        response(msg, sizeof (msg->Rversion));
+        msize = msg->Rversion.msize = min(INITIAL_MSIZE, msg->Tversion.msize);
+        msg->size = putstr(buf + msg->size, buf + msize, "9P2000") - buf;
         break;
 
     case Tattach:
@@ -415,39 +435,38 @@ void Plan9::handler()
         CHECK(!get_entry(msg->fid), FID_IN_USE_TEXT);
         entry = get_entry(QTDIR, "/");
         add_fid(msg->fid, entry);
-        start_response(msg, sizeof (msg->Rattach));
+        response(msg, sizeof (msg->Rattach));
         msg->Rattach.qid = entry;
         break;
 
     case Tflush:
         DEBUG_PRINTF("Tflush\n");
         CHECK(msg->size == sizeof (msg->Tflush), EBADMSG_TEXT);
-        start_response(msg, sizeof (Header));
+        response(msg, sizeof (Header));
         // do nothing
         break;
 
     case Twalk:
-        DEBUG_PRINTF("Twalk fid=%lu newfid=%lu\n", msg->Twalk.fid, msg->Twalk.newfid);
+        DEBUG_PRINTF("Twalk fid=%lu newfid=%lu nwname=%u\n", msg->Twalk.fid, msg->Twalk.newfid, msg->Twalk.nwname);
         CHECK(entry = get_entry(msg->Twalk.fid), FID_UNKNOWN_TEXT);
         CHECK(!get_entry(msg->Twalk.newfid), FID_IN_USE_TEXT);
+        CHECK(msg->Twalk.nwname <= MAXWELEM, EBADMSG_TEXT);
 
         if (msg->Twalk.nwname == 0) {
-            start_response(msg, sizeof (msg->Rwalk));
-            msg->Rwalk.nwqid = 0;
+            response(msg, sizeof (msg->Rwalk));
             add_fid(msg->Twalk.newfid, entry);
+            msg->Rwalk.nwqid = 0;
         } else {
-            std::string path = entry->path;
+            std::string path = entry->first;
             const char* wname = msg->Twalk.wname;
             uint16_t num_entries = 0;
-            Entry* entries[MAXWELEM];
-
-            CHECK(msg->Twalk.nwname <= MAXWELEM, EBADMSG_TEXT);
+            Entry entries[MAXWELEM];
 
             for (uint16_t i = 0; i < msg->Twalk.nwname; ++i) {
-                CHECK(wname + 2 <= end, EBADMSG_TEXT);
+                CHECK(wname + 2 <= buf + msg->size, EBADMSG_TEXT);
                 uint16_t len = *wname++;
                 len |= *wname++ << 8;
-                CHECK(wname + len <= end, EBADMSG_TEXT);
+                CHECK(wname + len <= buf + msg->size, EBADMSG_TEXT);
                 path = join_path(path, std::string(wname, len));
                 wname += len;
 
@@ -470,23 +489,22 @@ void Plan9::handler()
             CHECK(num_entries > 0, ENOENT_TEXT);
             add_fid(msg->Twalk.newfid, entries[num_entries - 1]);
 
-            start_response(msg, sizeof (msg->Rwalk));
+            response(msg, sizeof (msg->Rwalk));
             msg->Rwalk.nwqid = num_entries;
-            Qid* wqid = msg->Rwalk.wqid;
-            for (uint16_t i = 0; i < num_entries; ++i) {
-                *wqid++ = entries[i];
-                msg->size += sizeof (Qid);
-            }
+            for (uint16_t i = 0; i < num_entries; ++i)
+                msg->Rwalk.wqid[i] = entries[i];
+            msg->size += num_entries  *sizeof (Qid);
         }
         break;
+
     case Tstat:
         CHECK(msg->size == sizeof (Header) + 4, EBADMSG_TEXT);
         CHECK(entry = get_entry(msg->fid), FID_UNKNOWN_TEXT);
 
-        DEBUG_PRINTF("Tstat fid=%lu %s\n", msg->fid, entry->path.c_str());
+        DEBUG_PRINTF("Tstat fid=%lu %s\n", msg->fid, entry->first.c_str());
 
-        start_response(msg, sizeof (msg->Rstat));
-        CHECK((msg->Rstat.stat_size = putstat(reinterpret_cast<char*>(&(msg->Rstat.stat)), buf + uip_mss(), entry)) > 0, EFAULT_TEXT);
+        response(msg, sizeof (msg->Rstat));
+        CHECK((msg->Rstat.stat_size = putstat(reinterpret_cast<char*>(&(msg->Rstat.stat)), buf + msize, entry)) > 0, EFAULT_TEXT);
         msg->size = sizeof (Header) + 2 + msg->Rstat.stat_size;
         break;
 
@@ -495,21 +513,21 @@ void Plan9::handler()
         CHECK(get_entry(msg->fid), FID_UNKNOWN_TEXT);
         CHECK(msg->size == sizeof (Header) + 4, EBADMSG_TEXT);
         remove_fid(msg->fid);
-        start_response(msg, sizeof (Header));
+        response(msg, sizeof (Header));
         break;
 
     case Topen:
         CHECK(msg->size == sizeof (msg->Topen), EBADMSG_TEXT);
         CHECK(entry = get_entry(msg->fid), FID_UNKNOWN_TEXT);
-        DEBUG_PRINTF("Topen fid=%lu %s\n", msg->fid, entry->path.c_str());
+        DEBUG_PRINTF("Topen fid=%lu %s\n", msg->fid, entry->first.c_str());
 
-        if (entry->type != QTDIR && (msg->Topen.mode & OTRUNC)) {
-            FILE* fp = fopen(entry->path.c_str(), "w");
+        if (entry->second.type != QTDIR && (msg->Topen.mode & OTRUNC)) {
+            FILE* fp = fopen(entry->first.c_str(), "w");
             CHECK(fp, EIO_TEXT);
             fclose(fp);
         }
 
-        start_response(msg, sizeof (msg->Ropen));
+        response(msg, sizeof (msg->Ropen));
         msg->Ropen.qid = entry;
         msg->Ropen.iounit = IOUNIT;
         break;
@@ -520,49 +538,50 @@ void Plan9::handler()
         CHECK(msg->Tread.count <= IOUNIT, EBADMSG_TEXT);
         CHECK(entry = get_entry(msg->fid), FID_UNKNOWN_TEXT);
 
-        if (entry->type == QTDIR) {
-            DIR* dir = opendir(entry->path.c_str());
+        if (entry->second.type == QTDIR) {
+            DIR* dir = opendir(entry->first.c_str());
             CHECK(dir, EIO_TEXT);
 
             auto offset = msg->Tread.offset;
             auto count = msg->Tread.count;
 
-            start_response(msg, sizeof (msg->Rread));
+            response(msg, sizeof (msg->Rread));
             char* data = buf + sizeof (msg->Rread);
-            struct dirent* ent;
-            while ((ent = readdir(dir)) && count > 0) {
-                auto path = join_path(entry->path, ent->d_name);
+            struct dirent* d;
+            while ((d = readdir(dir)) && count > 0) {
+                auto path = join_path(entry->first, d->d_name);
                 DEBUG_PRINTF("Tread path %s\n", path.c_str());
 
-                Entry* child = get_entry(ent->d_isdir ? QTDIR : QTFILE, path);
-                char buf[sizeof (Stat) + 128];
-                size_t stat_size = putstat(buf, buf + sizeof (buf), child);
+                Entry child = get_entry(d->d_isdir ? QTDIR : QTFILE, path);
+                char stat_buf[sizeof (Stat) + 128];
+                size_t stat_size = putstat(stat_buf, stat_buf + sizeof (stat_buf), child);
                 CHECK(stat_size > 0, EFAULT_TEXT);
 
                 if (offset >= stat_size) {
                     offset -= stat_size;
                 } else {
-                    uint16_t size = stat_size - offset;
-                    if (size > count)
-                        break;
-                    memcpy(data + offset, buf, size);
-                    data += size;
-                    msg->Rread.count += size;
-                    msg->size += size;
-                    offset = 0;
-                    count -= size;
+                    CHECK(offset == 0, EBADMSG_TEXT);
+                    if (stat_size > count) {
+                        count = 0;
+                    } else {
+                        memcpy(data, stat_buf, stat_size);
+                        data += stat_size;
+                        msg->Rread.count += stat_size;
+                        msg->size += stat_size;
+                        count -= stat_size;
+                    }
                 }
             }
             closedir(dir);
         } else {
-            FILE* fp = fopen(entry->path.c_str(), "r");
+            FILE* fp = fopen(entry->first.c_str(), "r");
             CHECK(fp, EIO_TEXT);
             if (fseek(fp, msg->Tread.offset, SEEK_SET)) {
                 fclose(fp);
-                FAIL(EIO_TEXT);
+                ERROR(EIO_TEXT);
             }
             uint32_t count = msg->Tread.count;
-            start_response(msg, sizeof (msg->Rread));
+            response(msg, sizeof (msg->Rread));
             msg->Rread.count = fread(buf + msg->size, 1, count, fp);
             auto ok = msg->Rread.count == count || !ferror(fp);
             fclose(fp);
@@ -574,10 +593,10 @@ void Plan9::handler()
     case Tcreate:
         {
             CHECK(msg->size == sizeof (msg->Tcreate) + msg->Tcreate.name_size + 4 + 1, EBADMSG_TEXT);
-            CHECK(msg->Tcreate.name + msg->Tcreate.name_size + 4 <= end, EBADMSG_TEXT);
+            CHECK(msg->Tcreate.name + msg->Tcreate.name_size + 4 <= buf + msg->size, EBADMSG_TEXT);
             CHECK(entry = get_entry(msg->fid), FID_UNKNOWN_TEXT);
 
-            auto path = join_path(entry->path, std::string(msg->Tcreate.name, msg->Tcreate.name_size));
+            auto path = join_path(entry->first, std::string(msg->Tcreate.name, msg->Tcreate.name_size));
             uint32_t perm;
             memcpy(&perm, msg->Tcreate.name + msg->Tcreate.name_size, 4);
 
@@ -591,11 +610,11 @@ void Plan9::handler()
                 CHECK(fp, EIO_TEXT);
                 fclose(fp);
             }
-            ++entry->vers;
-            --entry->refcount;
+            ++entry->second.vers;
+            --entry->second.refcount;
             entry = get_entry((perm & DMDIR) ? QTDIR : QTFILE, path);
             fids[msg->fid] = entry;
-            start_response(msg, sizeof (msg->Rcreate));
+            response(msg, sizeof(msg->Rcreate));
             msg->Rcreate.qid = entry;
             msg->Rcreate.iounit = IOUNIT;
         }
@@ -608,11 +627,11 @@ void Plan9::handler()
             CHECK(msg->Twrite.count <= IOUNIT, EBADMSG_TEXT);
             CHECK(entry = get_entry(msg->fid), FID_UNKNOWN_TEXT);
 
-            FILE* fp = fopen(entry->path.c_str(), "r+");
+            FILE* fp = fopen(entry->first.c_str(), "r+");
             CHECK(fp, EIO_TEXT);
             if (fseek(fp, msg->Twrite.offset, SEEK_SET)) {
                 fclose(fp);
-                FAIL(EIO_TEXT);
+                ERROR(EIO_TEXT);
             }
 
             uint32_t count = fwrite(buf + sizeof (msg->Twrite), 1, msg->Twrite.count, fp);
@@ -620,9 +639,9 @@ void Plan9::handler()
             fclose(fp);
             CHECK(ok, EIO_TEXT);
 
-            start_response(msg, sizeof (msg->Rwrite));
+            response(msg, sizeof (msg->Rwrite));
             msg->Rwrite.count = count;
-            ++entry->vers;
+            ++entry->second.vers;
         }
         break;
 
@@ -631,12 +650,12 @@ void Plan9::handler()
             DEBUG_PRINTF("Tremove fid=%lu\n", msg->fid);
             CHECK(msg->size == sizeof (Header) + 4, EBADMSG_TEXT);
             CHECK(entry = get_entry(msg->fid), FID_UNKNOWN_TEXT);
-            Entry e = *entry;
+            auto e = *entry;
             remove_fid(msg->fid);
-            if (e.refcount == 0)
-                entries.erase(e.path);
-            CHECK(!remove(e.path.c_str()), e.type == QTDIR ? ENOTEMPTY_TEXT : EIO_TEXT);
-            start_response(msg, sizeof (Header));
+            if (e.second.refcount == 0)
+                entries.erase(e.first);
+            CHECK(!remove(e.first.c_str()), e.second.type == QTDIR ? ENOTEMPTY_TEXT : EIO_TEXT);
+            response(msg, sizeof (Header));
         }
         break;
 
@@ -647,16 +666,16 @@ void Plan9::handler()
             char* name = buf + sizeof (msg->Twstat);
             uint16_t len = *name++;
             len |= *name++ << 8;
-            CHECK(name + len <= end, EBADMSG_TEXT);
-            start_response(msg, sizeof (Header));
-            if (len > 0 && entry->path != "/") {
-                std::string newpath = join_path(entry->path.substr(0, entry->path.rfind('/')), std::string(name, len));
-                if (newpath != entry->path) {
-                    CHECK(!rename(entry->path.c_str(), newpath.c_str()), EIO_TEXT);
-                    Entry* newentry = get_entry(entry->type, newpath);
+            CHECK(name + len <= buf + msg->size, EBADMSG_TEXT);
+            response(msg, sizeof (Header));
+            if (len > 0 && entry->first != "/") {
+                std::string newpath = join_path(entry->first.substr(0, entry->first.rfind('/')), std::string(name, len));
+                if (newpath != entry->first) {
+                    CHECK(!rename(entry->first.c_str(), newpath.c_str()), EIO_TEXT);
+                    Entry newentry = get_entry(entry->second.type, newpath);
                     remove_fid(msg->fid);
-                    if (entry->refcount == 0)
-                        entries.erase(entry->path);
+                    if (entry->second.refcount == 0)
+                        entries.erase(entry->first);
                     add_fid(msg->fid, newentry);
                 }
             }
@@ -665,7 +684,7 @@ void Plan9::handler()
 
     // not implemented
     // case Tauth:
-    //     start_response(msg);
+    //     response(msg);
     //     msg->Rauth.aqid.type = 0;
     //     msg->Rauth.aqid.vers = 0;
     //     msg->Rauth.aqid.path = 1;
@@ -673,8 +692,6 @@ void Plan9::handler()
 
     default:
         DEBUG_PRINTF("Unknown message %u\n", msg->type);
-        return send_error(ENOSYS_TEXT);
+        ERROR(ENOSYS_TEXT);
     }
-
-    uip_send(msg, msg->size);
 }
